@@ -1,0 +1,96 @@
+import os
+import json
+from datetime import datetime
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+# ─────────────────────────────────────────────────────────────
+# INITIALIZATION
+# ─────────────────────────────────────────────────────────────
+def init_firestore():
+    if not firebase_admin._apps:
+        cred = credentials.Certificate("firebase_service_account.json")
+        firebase_admin.initialize_app(cred)
+    return firestore.client()
+
+def export_approved_knowledge_base():
+    db = init_firestore()
+    
+    print("⏳ Pulling pages from 'psm_pages' collection...")
+    # Fetch all documents inside your nested metrics tracking pool
+    pages_ref = db.collection("psm_pages")
+    pages_docs = pages_ref.stream()
+    
+    compiled_knowledge_base = []
+    total_pages_processed = 0
+    total_chunks_extracted = 0
+
+    for doc in pages_docs:
+        page_data = doc.to_dict()
+        page_id = doc.id
+        
+        # Pull metadata components written by your scraper logic
+        title = page_data.get("title", "Untitled Page")
+        url = page_data.get("url", "")
+        doc_links = page_data.get("doc_links", [])
+        picture_links = page_data.get("picture_links", [])
+        
+        # Read the nested chunks map array written to this document block
+        chunks = page_data.get("chunks", [])
+        
+        # Filter for chunks specifically validated as true by the admin interface
+        approved_chunks = [c for c in chunks if c.get("approved") is True]
+        
+        if not approved_chunks:
+            continue  # Skip entire document framework if no valid vectors are present
+
+        total_pages_processed += 1
+        
+        # Build clean structural frames natively parsed by your Vector database ingestion process
+        for chunk in approved_chunks:
+            total_chunks_extracted += 1
+            
+            kb_entry = {
+                "chunk_uid": f"{page_id}_{chunk.get('index', 0)}",
+                "source_title": title,
+                "source_url": url,
+                "content": chunk.get("content", "").strip(),
+                "text_length": chunk.get("chunk_length", 0),
+                "reference_assets": {
+                    "downloadable_documents": doc_links,
+                    "visual_attachments": picture_links
+                },
+                "compiled_at": datetime.now().isoformat()
+            }
+            compiled_knowledge_base.append(kb_entry)
+
+    # ─────────────────────────────────────────────────────────────
+    # OUTPUT COMPILATION
+    # ─────────────────────────────────────────────────────────────
+    output_directory = "psm_production_output"
+    os.makedirs(output_directory, exist_ok=True)
+    output_file_path = os.path.join(output_directory, "knowledge_base.json")
+    
+    # Structure payload metrics wrap wrapper
+    final_payload = {
+        "export_metadata": {
+            "total_extracted_pages": total_pages_processed,
+            "total_validated_chunks": total_chunks_extracted,
+            "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "RAG_READY"
+        },
+        "data": compiled_knowledge_base
+    }
+    
+    with open(output_file_path, "w", encoding="utf-8") as f:
+        json.dump(final_payload, f, ensure_ascii=False, indent=4)
+        
+    print("\n" + "═"*60)
+    print("🚀 PIPELINE EXPORT COMPLETED SUCCESSFULLY!")
+    print(f"📁 Source Documents Sampled : {total_pages_processed}")
+    print(f"🧠 Verified Vector Chunks    : {total_chunks_extracted}")
+    print(f"💾 Production Payload Path   : {output_file_path}")
+    print("═"*60)
+
+if __name__ == "__main__":
+    export_approved_knowledge_base()

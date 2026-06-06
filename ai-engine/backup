@@ -1,0 +1,562 @@
+"""
+PSM UTM Web Scraper + RAG JSON Generator
+========================================
+Features:
+---------
+✅ Crawl PSM website
+✅ Extract readable contents
+✅ Describe images using LLaVA (Ollama) — specifically inside .et_post_meta_wrapper
+✅ Generate RAG-ready chunks
+✅ Generate JSON / TXT / HTML reports
+✅ Upload output files to Firebase Storage
+"""
+
+import os
+import re
+import json
+import time
+import base64
+import urllib.parse
+from collections import deque
+from datetime import datetime
+
+import requests
+from bs4 import BeautifulSoup
+import ollama
+
+
+# ─────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────
+
+BASE_URL = "https://comp.utm.my/psm/"
+OUTPUT_DIR = "psm_output"
+MAX_PAGES = 50
+CRAWL_DELAY = 1.0
+TIMEOUT = 15
+CHUNK_SIZE = 200  # words
+
+MIN_IMAGE_BYTES = 5000
+
+DOCUMENT_EXTENSIONS = {
+    ".pdf", ".docx", ".doc",
+    ".xlsx", ".xls",
+    ".pptx", ".ppt",
+    ".zip", ".rar",
+    ".csv",
+}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; PSM-Scraper/1.0)"
+}
+
+IMAGE_PAGE_WHITELIST = [
+    "https://comp.utm.my/psm/2025/10/02/sem22526-psm2-calendar-brief/",
+    "https://comp.utm.my/psm/2025/10/02/sem22526-psm1-calendar-brief/",
+]
+
+# ─────────────────────────────────────────────────────────────
+# FIREBASE CONFIG
+# ─────────────────────────────────────────────────────────────
+# Fill in your Firebase project details here.
+# You can find these in your Firebase project settings.
+
+FIREBASE_CONFIG = {
+    # Your Firebase Storage bucket name, e.g. "my-project.appspot.com"
+    "storage_bucket": os.environ.get("FIREBASE_STORAGE_BUCKET", "fyp-chatbot-e22c5.firebasestorage.app"),
+
+    # Optional: folder/prefix inside the bucket to upload files into.
+    # Leave as "" to upload to the bucket root.
+    # Example: "psm_reports/2025" → files land at psm_reports/2025/report.json
+    "upload_prefix": os.environ.get("FIREBASE_UPLOAD_PREFIX", "psm_reports"),
+
+    # Path to your Firebase service account JSON key file.
+    # Generate one from: Firebase Console → Project Settings → Service Accounts
+    # Leave as "" to attempt Application Default Credentials (ADC) instead.
+    "service_account_key_path": os.environ.get(
+        "FIREBASE_SERVICE_ACCOUNT_KEY", "firebase_service_account.json"
+    ),
+}
+
+# Set to False to skip the upload step entirely.
+ENABLE_FIREBASE_UPLOAD = True
+
+
+# ─────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def clean_text(text):
+    """Clean spaces/newlines."""
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def fetch(url, session):
+    try:
+        response = session.get(url, headers=HEADERS, timeout=TIMEOUT)
+        response.raise_for_status()
+        return BeautifulSoup(response.text, "lxml")
+    except Exception as e:
+        print(f"  [skip] {url} — {e}")
+        return None
+
+
+def normalise(href, base):
+    if not href:
+        return None
+    if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+        return None
+    return urllib.parse.urljoin(base, href.strip())
+
+
+def is_internal(url):
+    return (
+        urllib.parse.urlparse(url).netloc ==
+        urllib.parse.urlparse(BASE_URL).netloc
+    )
+
+
+def get_ext(url):
+    return os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+
+
+def is_doc(url):
+    return get_ext(url) in DOCUMENT_EXTENSIONS
+
+
+def is_whitelisted_page(url):
+    if not IMAGE_PAGE_WHITELIST:
+        return True
+    url_norm = url.rstrip("/")
+    return any(
+        url_norm == entry.rstrip("/")
+        for entry in IMAGE_PAGE_WHITELIST
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# IMAGE HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def download_image_as_base64(url, session):
+    try:
+        response = session.get(url, timeout=10, headers=HEADERS)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "")
+        if "image" not in content_type:
+            return None
+        if len(response.content) < MIN_IMAGE_BYTES:
+            return None
+        return base64.b64encode(response.content).decode("utf-8")
+    except Exception as e:
+        print(f"    [img skip] {url} — {e}")
+        return None
+
+
+def describe_image(image_b64):
+    try:
+        response = ollama.chat(
+            model="llava",
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Describe this image briefly in 1-2 sentences. "
+                        "Focus on any text, charts, diagrams, calendar dates, "
+                        "or important content visible. Be concise."
+                    ),
+                    "images": [image_b64],
+                }
+            ],
+        )
+        return response["message"]["content"].strip()
+    except Exception as e:
+        print(f"    [llava error] {e}")
+        return None
+
+
+def split_into_chunks(text, chunk_size=CHUNK_SIZE):
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), chunk_size):
+        chunk_text = " ".join(words[i:i + chunk_size])
+        chunks.append(chunk_text)
+    return chunks
+
+
+# ─────────────────────────────────────────────────────────────
+# FIREBASE UPLOAD
+# ─────────────────────────────────────────────────────────────
+
+def _get_storage_bucket():
+    """
+    Initialise and return the Firebase Storage bucket.
+    Uses a service account key file if found, otherwise falls back to
+    Application Default Credentials (ADC — useful for GCP-hosted environments).
+    """
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, storage
+    except ImportError:
+        raise ImportError(
+            "firebase-admin is not installed.\n"
+            "Run:  pip install firebase-admin"
+        )
+
+    bucket_name = FIREBASE_CONFIG["storage_bucket"]
+    if not bucket_name:
+        raise ValueError(
+            "FIREBASE_CONFIG['storage_bucket'] is empty.\n"
+            "Set the bucket name or the FIREBASE_STORAGE_BUCKET environment variable."
+        )
+
+    # Avoid re-initialising if already done
+    if not firebase_admin._apps:
+        key_path = FIREBASE_CONFIG["service_account_key_path"]
+        if key_path and os.path.isfile(key_path):
+            print(f"  🔑 Using service account key: {key_path}")
+            cred = credentials.Certificate(key_path)
+        else:
+            print("  🔑 Service account key not found — using Application Default Credentials (ADC)")
+            cred = credentials.ApplicationDefault()
+
+        firebase_admin.initialize_app(cred, {"storageBucket": bucket_name})
+
+    return storage.bucket()
+
+
+def upload_to_firebase(local_paths: list[str]) -> dict[str, str]:
+    """
+    Upload a list of local file paths to Firebase Storage.
+
+    Returns a dict mapping local filename → public download URL.
+    """
+    if not ENABLE_FIREBASE_UPLOAD:
+        print("\n  ⏭  Firebase upload is disabled (ENABLE_FIREBASE_UPLOAD=False)")
+        return {}
+
+    print("\n" + "─" * 60)
+    print("Uploading to Firebase Storage …")
+
+    try:
+        bucket = _get_storage_bucket()
+    except Exception as e:
+        print(f"  ✗ Could not connect to Firebase: {e}")
+        return {}
+
+    prefix = FIREBASE_CONFIG.get("upload_prefix", "").strip("/")
+    upload_results = {}
+
+    for local_path in local_paths:
+        if not os.path.isfile(local_path):
+            print(f"  [skip] File not found: {local_path}")
+            continue
+
+        filename = os.path.basename(local_path)
+        # Build the destination path inside the bucket
+        destination_blob_name = f"{prefix}/{filename}" if prefix else filename
+
+        try:
+            blob = bucket.blob(destination_blob_name)
+
+            # Determine content type from extension
+            ext = get_ext(local_path)
+            content_type_map = {
+                ".json": "application/json",
+                ".txt":  "text/plain",
+                ".html": "text/html",
+            }
+            content_type = content_type_map.get(ext, "application/octet-stream")
+
+            blob.upload_from_filename(local_path, content_type=content_type)
+
+            # Make the file publicly readable
+            blob.make_public()
+            public_url = blob.public_url
+
+            upload_results[filename] = public_url
+            print(f"  ✓ {filename}  →  {public_url}")
+
+        except Exception as e:
+            print(f"  ✗ Failed to upload {filename}: {e}")
+
+    return upload_results
+
+
+def save_upload_manifest(upload_results: dict[str, str]):
+    """Save the upload results (filename → URL) as a JSON manifest."""
+    if not upload_results:
+        return
+    manifest_path = os.path.join(OUTPUT_DIR, "firebase_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "bucket":      FIREBASE_CONFIG["storage_bucket"],
+                "prefix":      FIREBASE_CONFIG.get("upload_prefix", ""),
+                "files":       upload_results,
+            },
+            f,
+            ensure_ascii=False,
+            indent=4,
+        )
+    print(f"  ✓ Upload manifest → {manifest_path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# SCRAPER
+# ─────────────────────────────────────────────────────────────
+
+def scrape():
+    session = requests.Session()
+    visited = set()
+    queue = deque([BASE_URL] + IMAGE_PAGE_WHITELIST)
+    pages = []
+
+    print(f"Starting scrape: {BASE_URL}")
+    print("─" * 60)
+
+    while queue and len(visited) < MAX_PAGES:
+        url = queue.popleft()
+        if url in visited:
+            continue
+        visited.add(url)
+
+        soup = fetch(url, session)
+        if not soup:
+            continue
+
+        for tag in soup(["script", "style", "noscript", "iframe"]):
+            tag.decompose()
+
+        title = clean_text(soup.title.string) if soup.title and soup.title.string else url
+
+        # Content
+        content_parts = []
+        for tag in soup.find_all(["h1", "h2", "h3", "h4", "p", "li"]):
+            text = clean_text(tag.get_text(" ", strip=True))
+            if len(text) > 20:
+                content_parts.append({"tag": tag.name, "text": text})
+
+        # Menus
+        menus = []
+        seen_menu = set()
+        for a in soup.select("nav a, ul.menu a, #primary-menu a, .navbar-nav a, .main-navigation a"):
+            label = clean_text(a.get_text())
+            href = normalise(a.get("href", ""), url)
+            if label and href and href not in seen_menu:
+                seen_menu.add(href)
+                menus.append({"label": label, "url": href})
+
+        # ── Images (TARGETED CLASS LOGIC) ──
+        images = []
+        seen_img = set()
+        should_describe = is_whitelisted_page(url)
+
+        if should_describe:
+            print(f"\n  ✅ WHITELISTED — Targeting .et_post_meta_wrapper on: {url}")
+            wrapper = soup.find(class_="et_post_meta_wrapper")
+            img_tags = wrapper.find_all("img") if wrapper else soup.find_all("img")
+        else:
+            img_tags = soup.find_all("img")
+
+        for img in img_tags:
+            src = img.get("src") or img.get("data-src") or ""
+            full = normalise(src, url)
+            if not full or full in seen_img:
+                continue
+            seen_img.add(full)
+            alt = clean_text(img.get("alt", "")) or ""
+
+            if should_describe:
+                print(f"    🖼  Describing: {full[:70]}")
+                image_b64 = download_image_as_base64(full, session)
+                if image_b64:
+                    ai_description = describe_image(image_b64) or alt or "(could not describe image)"
+                else:
+                    ai_description = alt or "(no description)"
+            else:
+                ai_description = alt or "(description skipped)"
+
+            images.append({
+                "src": full,
+                "alt": alt or "(no alt text)",
+                "ai_description": ai_description,
+            })
+
+        # Documents
+        documents = []
+        seen_doc = set()
+        for a in soup.find_all("a", href=True):
+            link = normalise(a["href"], url)
+            if link and is_doc(link) and link not in seen_doc:
+                seen_doc.add(link)
+                documents.append({
+                    "label": clean_text(a.get_text()) or link.split("/")[-1],
+                    "url": link,
+                    "type": get_ext(link).replace(".", "").upper(),
+                })
+
+        # Text Combination & Chunking
+        page_text = "\n".join([item["text"] for item in content_parts])
+        image_descriptions = "\n".join([
+            f"Image: {img['ai_description']}"
+            for img in images
+            if img["ai_description"] not in ("(no description)", "(could not describe image)", "(description skipped)")
+        ])
+
+        combined_text = page_text
+        if image_descriptions:
+            combined_text += "\n\nImage Content:\n" + image_descriptions
+
+        structured_chunks = []
+        for idx, chunk in enumerate(split_into_chunks(combined_text)):
+            structured_chunks.append({
+                "chunk_id": f"{len(pages)}_{idx}",
+                "content": chunk,
+                "chunk_length": len(chunk),
+                "source_title": title,
+                "source_url": url,
+            })
+
+        pages.append({
+            "title": title,
+            "url": url,
+            "menus": menus,
+            "documents": documents,
+            "images": images,
+            "chunks": structured_chunks,
+        })
+
+        print(f"  [{len(visited):02d}] {title[:50]:<50} chunks={len(structured_chunks)} imgs={len(images)}")
+
+        # Queue internal links
+        for a in soup.find_all("a", href=True):
+            nxt = normalise(a["href"], url)
+            if nxt and is_internal(nxt) and not is_doc(nxt) and nxt not in visited:
+                queue.append(nxt)
+
+        time.sleep(CRAWL_DELAY)
+
+    return pages
+
+
+# ─────────────────────────────────────────────────────────────
+# SAVE REPORTS
+# ─────────────────────────────────────────────────────────────
+
+def save_json(pages):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    total_chunks = sum(len(page["chunks"]) for page in pages)
+    data = {
+        "metadata": {
+            "source": BASE_URL,
+            "generated_at": now,
+            "total_pages": len(pages),
+            "total_chunks": total_chunks,
+            "rag_ready": True,
+            "chunk_size": CHUNK_SIZE,
+            "image_page_whitelist": IMAGE_PAGE_WHITELIST,
+        },
+        "pages": pages,
+    }
+    path = os.path.join(OUTPUT_DIR, "report.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+    print(f"  ✓ JSON report → {path}")
+    return path
+
+
+def save_txt(pages):
+    now = datetime.now().strftime("%d %B %Y, %I:%M %p")
+    lines = [
+        "=" * 70, "PSM UTM WEBSITE REPORT", "=" * 70,
+        f"Source : {BASE_URL}", f"Date   : {now}", f"Pages  : {len(pages)}", "",
+    ]
+    for i, page in enumerate(pages, start=1):
+        lines.append("=" * 70)
+        lines.append(f"[{i}] {page['title']}")
+        lines.append("=" * 70)
+        lines.append(f"URL: {page['url']}\n\nCONTENT:\n" + "-" * 30)
+        lines.append("\n".join([chunk["content"] for chunk in page["chunks"]]))
+        if page["images"] and is_whitelisted_page(page["url"]):
+            lines.append("\nIMAGES (AI Described):\n" + "-" * 30)
+            for img in page["images"]:
+                lines.append(f"  src : {img['src']}\n  desc: {img['ai_description']}\n")
+
+    path = os.path.join(OUTPUT_DIR, "report.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"  ✓ TXT report → {path}")
+    return path
+
+
+def save_html(pages):
+    now = datetime.now().strftime("%d %B %Y, %I:%M %p")
+    html = (
+        "<html><head><meta charset='UTF-8'>"
+        "<style>"
+        "body{font-family:Arial;background:#f5f5f5;padding:20px;}"
+        ".card{background:white;border-radius:10px;padding:20px;margin-bottom:20px;}"
+        "h1{color:#003f7d;}.url{color:green;}.content{white-space:pre-wrap;}"
+        ".img-grid{display:flex;flex-wrap:wrap;gap:12px;}"
+        ".img-item{width:180px;font-size:12px;}"
+        ".badge{background:#d4edda;padding:2px 8px;border-radius:10px;}"
+        "</style></head><body>"
+        f"<h1>PSM UTM Website Report</h1><p>Generated: {now}</p>"
+    )
+    for page in pages:
+        full_text = " ".join([chunk["content"] for chunk in page["chunks"]])
+        img_html = '<div class="img-grid">' if page["images"] else ""
+        for img in page["images"]:
+            img_html += (
+                f'<div class="img-item">'
+                f'<img src="{img["src"]}" style="width:100%">'
+                f'<p>{img["ai_description"]}</p></div>'
+            )
+        if page["images"]:
+            img_html += "</div>"
+        html += (
+            f"<div class='card'><h2>{page['title']}</h2>"
+            f"<div class='url'>{page['url']}</div>"
+            f"<div class='content'>{full_text[:5000]}</div>"
+            f"{img_html}</div>"
+        )
+    html += "</body></html>"
+
+    path = os.path.join(OUTPUT_DIR, "report.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"  ✓ HTML report → {path}")
+    return path
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # 1. Scrape
+    pages_data = scrape()
+
+    # 2. Save reports and collect their paths
+    print("\n" + "─" * 60)
+    print("Saving reports …")
+    output_files = [
+        save_json(pages_data),
+        save_txt(pages_data),
+        save_html(pages_data),
+    ]
+
+    # 3. Upload to Firebase Storage
+    upload_results = upload_to_firebase(output_files)
+    save_upload_manifest(upload_results)
+
+    print("\nDONE!")
+    if upload_results:
+        print("\n📦 Uploaded files:")
+        for name, url in upload_results.items():
+            print(f"   {name}  →  {url}")

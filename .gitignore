@@ -1,0 +1,65 @@
+# ==========================================
+# 🔐 SENSITIVE DATA & CREDENTIALS
+# ==========================================
+.env
+.env.local
+.env.*.local
+# Ignore all service account credential formats
+*.json
+!package.json
+    
+# ==========================================
+# 🤖 AI PIPELINE, WEBSCRAPER & CACHE DATA
+# ==========================================
+# Local Web Scraper JSON dumps and text snapshots
+psm_output/
+psm_production_output/
+*.txt
+*.json
+!package.json
+
+# Vector Database Engines (All variants)
+ai-engine/chroma_db/
+ai-engine/db/
+chroma_db_local/
+.chroma/
+*.db
+*.sqlite3
+
+# ==========================================
+# 🐍 PYTHON ENVIRONMENT
+# ==========================================
+ai-engine/venv/
+venv/
+.venv/
+ai-engine/__pycache__/
+__pycache__/
+*.py[cod]
+*$py.class
+ai-engine/.ipynb_checkpoints/
+.pytest_cache/
+
+# ==========================================
+# ⚛️ NODE.JS / REACT FRONTEND
+# ==========================================
+node_modules/
+backend/node_modules/
+fronted/node_modules/
+.pnp
+.pnp.js
+
+# Build and Production compilation endpoints
+fronted/build/
+dist/
+out/
+*.log
+
+# ==========================================
+# 💻 IDE & OS SYSTEM SETTINGS
+# ==========================================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.suo
+*.ntvs*
